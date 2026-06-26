@@ -1,0 +1,26 @@
+[Unit]
+Description=GoIP Inbound SMS Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/goip-sms/goip_sms_in.py
+WorkingDirectory=/opt/goip-sms
+
+# Port 25 requires either root or this capability
+User=root
+# Alternatively, drop privileges and grant only the bind capability:
+# User=goipsms
+# AmbientCapabilities=CAP_NET_BIND_SERVICE
+# CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+Restart=on-failure
+RestartSec=10
+
+# Syslog identity is set inside the script (SMS_INBOUND / LOG_LOCAL0)
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
