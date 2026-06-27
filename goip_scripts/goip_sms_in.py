@@ -18,6 +18,48 @@ syslog.openlog(ident="SMS_INBOUND", facility=syslog.LOG_LOCAL0)
 # Load variables from .env file
 load_dotenv()
 
+# Matches GoIP multi-part prefix: (1), (2), etc., with optional surrounding spaces
+_PART_PREFIX_RE = re.compile(r'^\s*\(\d+\)\s*')
+BUFFER_TIMEOUT = 7  # seconds to wait after the last fragment before flushing
+
+
+class MessageBuffer:
+    """
+    Buffers GoIP multi-part SMS fragments (prefixed with (n)) per sender.
+    Resets the timeout on each new fragment; flushes when no new fragment
+    arrives within BUFFER_TIMEOUT seconds.
+    """
+
+    def __init__(self, on_flush):
+        # on_flush: async callable(to, from_tel, text)
+        self._on_flush = on_flush
+        # from_tel -> {'to': str, 'parts': [str], 'handle': TimerHandle | None}
+        self._pending: dict = {}
+
+    def feed(self, to: str, from_tel: str, text: str) -> bool:
+        """Return True if the message was buffered (has a (n) prefix)."""
+        if not _PART_PREFIX_RE.match(text):
+            return False
+        stripped = _PART_PREFIX_RE.sub('', text, count=1)
+        entry = self._pending.setdefault(from_tel, {'to': to, 'parts': [], 'handle': None})
+        entry['parts'].append(stripped)
+        if entry['handle'] is not None:
+            entry['handle'].cancel()
+        entry['handle'] = asyncio.get_running_loop().call_later(
+            BUFFER_TIMEOUT, self._flush, from_tel
+        )
+        return True
+
+    def _flush(self, from_tel: str):
+        entry = self._pending.pop(from_tel, None)
+        if entry:
+            combined = ''.join(entry['parts'])
+            syslog.syslog(syslog.LOG_INFO,
+                          f"Flushing {len(entry['parts'])} buffered parts from {from_tel}")
+            asyncio.get_event_loop().create_task(
+                self._on_flush(entry['to'], from_tel, combined)
+            )
+
 # Retrieve the string and parse it into a dictionary
 dids_raw = os.getenv("DIDS")
 DIDS = json.loads(dids_raw) if dids_raw else {}
@@ -38,6 +80,13 @@ def get_public_ip() -> str:
 class WebhookSender:
     def __init__(self):
         self.dids = DIDS
+        self._buffer = MessageBuffer(self._deliver)
+
+    async def _deliver(self, to: str, from_tel: str, text: str):
+        success = await self.hit_webhook(to, text, from_tel)
+        if not success:
+            syslog.syslog(syslog.LOG_ERR,
+                          f"Failed to deliver buffered SMS from {from_tel} to {to}")
 
     async def hit_webhook(self, to: str, text: str, from_tel: str) -> bool:
         """
@@ -71,8 +120,7 @@ class WebhookSender:
 
     async def goip_data_send(self, data: dict):
         if "error" in data:
-            msg = "Error processing incoming message"
-            syslog.syslog(syslog.LOG_ERR, msg)
+            syslog.syslog(syslog.LOG_ERR, "Error processing incoming message")
             return
 
         did = self.dids.get(data.get("channel"))
@@ -80,10 +128,17 @@ class WebhookSender:
             syslog.syslog(syslog.LOG_ERR, f"Unknown GoIP channel: {data.get('channel')}")
             return
 
-        success = await self.hit_webhook(did, data.get("text", ""), data.get("sender", ""))
+        text = data.get("text", "")
+        sender = data.get("sender", "")
+
+        if self._buffer.feed(did, sender, text):
+            syslog.syslog(syslog.LOG_INFO, f"Buffering part from {sender} (waiting for more)")
+            return
+
+        success = await self.hit_webhook(did, text, sender)
         if not success:
             syslog.syslog(syslog.LOG_ERR,
-                          f"Failed to deliver SMS from {data.get('sender')} on channel {data.get('channel')}")
+                          f"Failed to deliver SMS from {sender} on channel {data.get('channel')}")
 
 
 class GOIPSMTPHandler:
